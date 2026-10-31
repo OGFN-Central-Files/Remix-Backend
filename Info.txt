@@ -1,0 +1,205 @@
+ANÁLISIS: LAUNCHER REMIX + BACKEND REMIX (Xenon)
+1. LAUNCHER REMIX
+1.1 Stack tecnológico
+NO es Tauri ni Electron. Es una aplicación Win32 nativa en C++20 (Visual Studio, toolset v145, Windows SDK 10, SubSystem: Windows), con:
+
+UI: ImGui (vendida en source/vendor/imgui/) renderizada sobre DirectX 11 (imgui_impl_dx11.cpp), ventana WS_POPUP sin bordes con titlebar propia, esquinas redondeadas DWM (DwmSetWindowAttribute), DPI-aware.
+Fuentes embebidas: Geist (principal) + iconos Font Awesome (rango 0xf000-0xf3ff).
+nlohmann/json embebido (source/vendor/json.hpp), SHA-256 vía CNG/BCrypt, lazy_importer para ofuscación de imports (source/utils/obfuscation/lazy/lazy.hpp).
+Discord RPC (source/discord/rpc.cpp, App ID 1488731798140883165, launch.cpp:12).
+HTTP vía WinINet (wininet.h) y WinHTTP (solo para Arc).
+Proyecto VS: C:\Users\Cris\Documents\OGFN\Cosas\Launcher\Remix\Remix Launcher.sln → Remix Launcher\Remix Launcher.vcxproj (C++20: LanguageStandard stdcpp20, vcxproj líneas 94/111).
+Punto de entrada (entrypoint.cpp:5-13): WinMain → installer.CheckAndInstall() (instalador) → launch.init() → render.init() (bucle D3D11+ImGui).
+
+1.2 Estructura de archivos (sin binarios)
+
+text
+C:\Users\Cris\Documents\OGFN\Cosas\Launcher\Remix\
+├── Remix Launcher.sln
+└── Remix Launcher\
+    ├── entrypoint.cpp                  (WinMain)
+    ├── icon.ico / resource.rc / .vcxproj / .filters / .user
+    └── source\
+        ├── includes.hpp
+        ├── install\install.cpp/.hpp    (instalador + auto-update)
+        ├── api\api.cpp/.hpp            (cliente HTTP del backend: login, amigos, búsqueda)
+        ├── arc\arc.cpp/.hpp            (librería cliente "Arc" – auth externa del juego)
+        ├── launch\
+        │   ├── launch.cpp/.hpp         (init: RPC Discord + render)
+        │   ├── launch_game.cpp/.hpp    (MECANISMO DE LANZAMIENTO)
+        │   └── news\news.cpp/.hpp      (noticias hardcodeadas en el binario)
+        ├── discord\rpc.cpp/.hpp        (Rich Presence)
+        ├── ui\
+        │   ├── render.cpp/.hpp         (bucle D3D11, WndProc, enrutado de vistas)
+        │   ├── defines.hpp             (globales: r_auth_token, r_page, r_builds…)
+        │   ├── assets\assets.hpp       (logo/splash/fuentes/banner como arrays binarios)
+        │   ├── components\toast.cpp/.hpp
+        │   └── pages\  (include\ + src\) : login, home, library, friends, downloads, settings, sidebar
+        ├── utils\utils.cpp/.hpp        (config: builds.txt, registro Run, diálogos)
+        │   └── obfuscation\lazy\lazy.hpp
+        └── vendor\ (imgui completo, json.hpp, sha1.h)
+1.3 Cómo inicia sesión el usuario
+La única vía cableada a la UI es OAuth de Discord con polling (no hay formulario email/contraseña en esta versión):
+
+UI: source\ui\pages\src\login.cpp:66 — botón "Continue with Discord" → api.LoginWithDiscord().
+
+Flujo (source\api\api.cpp:449-536), con #define BACKEND_BASE "https://backend-snow-services.crisu.qzz.io" (api.cpp:18):
+
+Genera un state aleatorio de 16 hex (api.cpp:451-459).
+Abre el navegador con ShellExecuteA a: GET {BACKEND_BASE}/rmx/server/api/v1/discord/auth?state=<state> (api.cpp:465-466).
+En un hilo aparte hace polling cada 2 s, hasta 45 intentos (90 s) a: GET {BACKEND_BASE}/rmx/server/api/v1/discord/pending/<state> (api.cpp:469-476).
+Si la respuesta contiene "pending":true sigue; si no, parsea token y user{id, display_name, role_name, role_color, profile_picture} y fija r_auth_token, r_account_id, r_account_name (api.cpp:480-507). Descarga el avatar como bytes y lo sube a textura D3D11.
+r_auth_done = true → guarda sesión y arranca bucles de refresco (amigos + jugadores cada 30 s, api.cpp:518-528).
+Endpoint consumidos por el launcher (todos HTTPS, sin puerto local):
+
+Endpoint	Uso	Código
+GET /rmx/server/api/v1/discord/auth?state=	abre OAuth Discord	api.cpp:465
+GET /rmx/server/api/v1/discord/pending/<state>	recibe token+usuario	api.cpp:469
+GET /rmx/server/api/v1/clients	contador online (texto plano int)	api.cpp:205
+GET /rmx/server/api/v1/friends/<accountId>	lista de amigos	api.cpp:265
+GET /friends/api/v1/<accountId>/summary	solicitudes salientes	api.cpp:294
+POST/DELETE /friends/api/v1/<accountId>/friends/<friendId>	añadir/quitar amigo	api.cpp:318, 325
+GET /api/v1/search/<accId>?prefix=<q>&platform=default	búsqueda de jugadores	api.cpp:342
+GET /assets/launcher/version.json	auto-update	install.cpp:216
+Sesión persistente: %LOCALAPPDATA%\Remix Launcher\session.json con {token, account_id, display_name, profile_picture, role_name, role_color} (SaveSession/RestoreSession, api.cpp:20-29, 372-445). RestoreSession restaura sin re-login y relanza los refrescos periódicos.
+
+Nota: existe c_api::LoginWithArc (api.cpp:538-578) que crea una identidad JWT alg:none y la canjea contra el servicio externo Arc (CreateIdentity/CreateAuthSession), pero no está conectado a ninguna vista; solo se usa Arc en el lanzamiento del juego (ver 1.5).
+
+1.4 Gestión de configuración
+Todo en %LOCALAPPDATA%\Remix Launcher\ (c_utils::GetRemixDir, utils.cpp:233-241):
+
+Builds de Fortnite: builds.txt (una ruta por línea). AddBuild (utils.cpp:186-221) valida que existan \FortniteGame\Binaries\Win64, \FortniteGame\Content y \Engine\Binaries\Win64, lee la versión de Engine\Binaries\Win64\CrashReportClient.exe (ProductVersion, utils.cpp:143-173) y el splash de FortniteGame\Content\Splash\Splash.bmp. La ruta de Fortnite no se escribe a mano: se importa con BrowseFolder() (diálogo IFileOpenDialog, utils.cpp:367-395) desde Library → Import Build (library.cpp:18, 41).
+Auto-arranque: valor RemixLauncher en HKCU\...\CurrentVersion\Run (utils.cpp:336-365).
+Assets: %LOCALAPPDATA%\Remix Launcher\assets\logo.png y splash.png extraídos de recursos embebidos (render.cpp:506-511).
+Instalación/auto-update: CheckAndInstall (install.cpp:172-211) se copia a %LOCALAPPDATA%\Remix Launcher\<exe> + accesos directos (escritorio/menú inicio). CheckForUpdate (install.cpp:213-243) compara el SHA-256 del propio exe con assets/launcher/version.json del backend ({"signature":..., "url":"https://remixogfn.dev/assets/launcher/RemixLauncher.exe"}) y se reemplaza a sí mismo (.new/.old + relanzamiento).
+1.5 Pantallas / vistas y flujo
+El enrutado está en render.cpp:Render() (render.cpp:209-270), controlado por r_auth_done y r_page:
+
+Login (sin sesión): tarjeta centrada con logo REMIX y botón Discord + hint "Waiting for Discord login..." (login.cpp).
+Sidebar (sidebar.cpp:79-82): Home (0), Library (1), Downloads (4), Friends (3) + perfil con logout (modal de confirmación en render.cpp:272-349).
+Home (home.cpp): banner principal, contador "%d Online" con r_player_count (home.cpp:65), noticias estáticas hardcodeadas (news.cpp:6-8: "Remix is live").
+Library (library.cpp): grid de builds importados (splash, versión ++Fortnite+Release-X-CL-Y), botones Launch/Stop (launch_game.Launch(r_builds[i].path), library.cpp:105/181), Import Build y borrado con modal.
+Friends (friends.cpp): lista con avatares, búsqueda, añadir/eliminar.
+Downloads (downloads.cpp) y Settings (settings.cpp) — Settings está casi vacío: solo el título y el footer "Remix Launcher v1.0.0 · backend-snow-services.crisu.qzz.io" (settings.cpp:12).
+Overlays: modal de descarga "Downloading Required Files" con barra de progreso (render.cpp:368-423) y toasts.
+1.6 CÓMO LANZA EL JUEGO (mecanismo exacto, source\launch\launch_game.cpp)
+No abre ningún puerto local, no inyecta DLLs, no escucha sockets. La cadena es:
+
+Paso 1 — Prepara archivos (SetupBuild, launch_game.cpp:245-301):
+
+Descarga si falta o difiere en tamaño (comparación HEAD Content-Length vs tamaño local, HasToDownload:144-196):
+https://r2.ploosh.dev/remix/Arc.exe → <build>\Arc\Arc.exe (launch_game.cpp:254-267)
+https://r2.ploosh.dev/remix/RemixClient-Win64-Shipping.exe → <build>\FortniteGame\Binaries\Win64\RemixClient-Win64-Shipping.exe (elimina FortniteClient-Win64-Shipping-Remix.exe, launch_game.cpp:278-297). El "cliente" es un binario custom del juego que ya trae apuntando al backend privado.
+Escribe <build>\Arc\Config.json (launch_game.cpp:270-276):
+
+json
+{"ClientID":"zszxfhpnjgzxzvpiiopxqrfpivjqhxbh",
+ "Executable":"FortniteGame\\Binaries\\Win64\\RemixClient-Win64-Shipping.exe"}
+Paso 2 — Token de Arc (launch_game.cpp:347-371 + source\arc\arc.cpp):
+
+ArcInstance con ClientID = "zszxfhpnjgzxzvpiiopxqrfpivjqhxbh", ArcStage::Dev (dominios en arc.cpp:11-19: dev-auth-v1.arc-services.dev, etc.).
+CreateIdentity() (arc.cpp:97-117) fabrica un JWT sin firmar (alg:"none", arc.cpp:52-59) con payload {iat, exp=iat+300, iss=<display_name>, sub=<account_id>, dn=<display_name>}.
+CreateAuthSession() (arc.cpp:216-256) hace POST https://dev-auth-v1.arc-services.dev/api/v1/auth/session con body {"identity": "<jwt>"} y header X-Arc-Client: <ClientID> (WinHTTP, ignorando errores de certificado TLS, arc.cpp:161-165). La respuesta da auth.token (→ arcToken) y auth.clid. Arc es un servicio de terceros, no parte del backend Remix (el backend sí llama a Arc para desactivar el anticheat de una cuenta: remix_server_account_management.go:187-191, https://dev-anticheat-v1.arc-services.dev/router/v1/anticheat/public/deactivate/<id>).
+Paso 3 — Congela el launcher oficial y EAC (launch_game.cpp:373-387): localiza con búsqueda recursiva FortniteLauncher.exe, FortniteClient-Win64-Shipping_EAC.exe (o _EAC_EOS.exe), los crea con CreateProcessA(CREATE_SUSPENDED) y además llama NtSuspendProcess de ntdll sobre ambos (launch_game.cpp:38-49). Así el EAC/launcher original nunca llega a ejecutarse.
+
+Paso 4 — Lanza Arc.exe con los argumentos (launch_game.cpp:389-413, StartArc:62-82 desde <build>\Arc\):
+
+
+cpp
+std::string login    = r_account_name + "@project.remix";
+std::string password = r_auth_token.empty() ? "Rebooted" : r_auth_token;   // línea 389-390
+std::string fromfl   = bEacEOS ? "eaceos" : "eac";
+// caldera: dos JWT hardcodeados (líneas 391-394), tokens de anticheat estáticos
+
+std::string arcArgs =
+    "-epicapp=Fortnite -epicenv=Prod -epiclocale=en-us -epicportal"
+    " -skippatchcheck -nobe -nouac -nocodeguards"
+    " -fromfl=" + fromfl +
+    " -fltoken=3db3ba5dcbd2e16703f3978d"
+    " -caldera=" + caldera +
+    " -AUTH_LOGIN=" + login +
+    " -AUTH_PASSWORD=" + password +
+    " -AUTH_TYPE=epic"
+    " -t=" + arcToken;
+
+DWORD arcPid = StartArc(buildPath, arcArgs);   // línea 413
+Paso 5 — Monitorización: espera a que exista el proceso (30 s de timeout, WaitForGameProcess:124-133), marca LaunchState::Running y vigila mientras Arc.exe viva; al terminar hace StopArc() (termina Arc.exe con TerminateProcess).
+
+Cómo obtiene el juego el token/auth SIN puerto local: el par -AUTH_LOGIN=<Nombre>@project.remix -AUTH_PASSWORD=<token_del_launcher> -AUTH_TYPE=epic hace que el cliente (RemixClient custom) ejecute el flujo OAuth estándar de Epic, pero contra el dominio público del backend por HTTPS (la URL está compilada dentro del RemixClient). El backend responde en POST /account/api/oauth/token con grant_type=password (ver backend 2.3). Arc.exe actúa como orquestador intermedio que arranca el ejecutable declarado en su Config.json con esos mismos argumentos y gestiona el ciclo de vida (no es un servidor HTTP del usuario). El resto de servicios del juego (MCP/perfil, amigos, party, tienda, matchmaking por WebSocket /xenon/matchmaking/*, XMPP/Synapse) llegan igualmente al dominio público. La única referencia a 127.0.0.1 en el backend es interna del servidor (puerto 4040 del módulo de matchmaking, main.go:438).
+
+2. BACKEND REMIX ("Xenon")
+2.1 Stack
+Go (module github.com/remixfn/xenon, go.mod) con:
+
+Gin como framework HTTP + gin-contrib/cors (AllowOrigins *, main.go:129-133).
+"odin" (github.com/andr1ww/odin): base de datos embebida por buckets (archivos databases/xenon.db, xenon_profiles.db, xenon_comp.db, xenon_redeem.db, main.go:65-83).
+JWT HS256 (golang-jwt), bcrypt, gorilla/websocket (matchmaking), XMPP (gosrc.io/xmpp, módulo Synapse), SDK AWS S3, HTTP/2 (golang.org/x/net/http2), godotenv.
+Binario precompilado de 33 MB (main) + Dockerfile/docker-compose.yml/docker-entrypoint.sh.
+Puertos: HTTP :4880 y HTTPS :443 con certificado propio static/certs/server.crt|server.key (main.go:695-724 y 740-788). Dominio público: backend-snow-services.crisu.qzz.io (hay config Cloudflare en utilities/config.go:23-26).
+2.2 Estructura de archivos principal
+
+text
+Remix-Backend\
+├── main.go                       ( registro de TODAS las rutas + servidores HTTP/HTTPS )
+├── go.mod / go.sum / .env / Dockerfile / docker-compose.yml / docker-entrypoint.sh
+├── databases\                    ( *.db – datos odin )
+├── router\
+│   ├── oauth\oauth_create.go, oauth_exchange.go          ( OAuth Epic-style )
+│   ├── eos\eos_auth.go, eos_accounts.go, eos_sdk.go ...  ( auth EOS del juego )
+│   ├── fortnite\ (fortnite_*.go + mcp\*.go)              ( superficie Fortnite del cliente )
+│   ├── account_public\  (cuentas, deviceAuth)
+│   ├── friends\, party\, discovery\, cloudstorage\, matchmaking\
+│   ├── iridium\, mercury\, synapse\                      ( auths auxiliares )
+│   ├── remix\launcher\  remix_launcher*.go               ( API propia del launcher )
+│   └── remix\server\    remix_server_*.go                ( register/login/discord/friends/admin )
+├── modules\
+│   ├── matchmaking\  (WebSockets /xenon/matchmaking/*, servidor interno :4040)
+│   ├── storefront\   (generación de la tienda)
+│   ├── database\proxy.go, synapse\main.go (XMPP)
+├── classes\mcp\, managers\, utilities\ (config.go, middleware\auth_client.go…)
+├── static\ (playlists, battlepass, eventos, certs, stuff.ini, manifests)
+├── assets\ (launcher\version.json, dlls\, playlist-images, shop.json)
+└── admin\ (panel web: index/login/shop.html + script.js)
+2.3 Endpoints HTTP expuestos (main.go, con handlers)
+Auth estilo Epic (la que consume el JUEGO):
+
+POST /account/api/oauth/token — oauth.PostOAuthToken (main.go:388). Grant types soportados en oauth_create.go:26-538:
+device_auth (account_id+secret+device_id),
+authorization_code y exchange_code (bucket ExchangeCodes, caducidad 5 min, líneas 88-167),
+password (líneas 169-236): si el username acaba en @project.remix (exactamente lo que el launcher pasa como -AUTH_LOGIN), busca por username/display_name, comprueba ban, y para cuentas no-servidor aplica gate beta: consulta los roles del usuario en el guild de Discord vía GET discord.com/api/v10/guilds/<GUILD_ID>/members/<id> con el bot token y exige que tenga alguno de BETA_ROLE_IDS (líneas 203-233); si no, 404.
+client_credentials, refresh_token, epic_credentials, y default (acepta que password sea un JWT con sub).
+Emite access_token + refresh_token (funciones createAccessToken/createRefreshToken, líneas 736-816): JWT HS256 firmados con utilities.Get[string]("jwt") (= env JWTSECRET), claims estilo Epic (clid, dn, am, jti, expires_in), y guarda sesión en bucket Accounts_Sessions (un ticker las borra a las 24 h, main.go:746-779).
+POST /account/api/oauth/token/switch, GET|POST /account/api/oauth/exchange (main.go:386-392).
+POST /auth/v1/oauth/token → eos.GETEOSAuth (main.go:248; eos_auth.go:23+): grant client_credentials y external_auth — parsea el JWT sin verificar (ParseUnverified) para sacar dn/sub y firma tokens EOS con exp: 2147483647. También POST /epic/oauth/v2/token, GET /epic/id/v2/sdk/accounts, GET /sdk/v1/default, GET /account/api/oauth/verify, DELETE /account/api/oauth/sessions/kill.
+POST /account/api/public/account/:accountId/deviceAuth y POST /api/v3/external/devices/ (device auth v3).
+API propia del launcher (/rmx/server/api/v1, main.go:434-514):
+
+POST /register — bcrypt + rate-limit 5/10 s por IP + header Authorization: <JWTSECRET>:server obligatorio (remix_server_register.go:54-170).
+POST /login — email+password bcrypt → {response: <perfil>, auth: <JWT clsvc:"remix">} + sesión tipo "login" (remix_server_login.go:17-122).
+GET /discord/auth (redirect a discord.com/oauth2/authorize, scope identify email), GET /discord/callback (canjea el código en discord.com/api/oauth2/token, lee users/@me, calcula el rol más alto del guild con el bot token, crea/carga cuenta, firma JWT y lo guarda en pendingAuthMap[state] con TTL 10 min; devuelve HTML que hace window.opener.postMessage({type:'discord_auth', token, user})), GET /discord/pending/:state (devuelve {"pending":true} o {"token","user"}) — remix_server_discord.go:124/148/456.
+GET /friends/:accountId (usa el servidor interno http://127.0.0.1:4040/friends/status/<id>, remix_server_friends.go:25), GET /clients (contador desde http://127.0.0.1:4040/connections, main.go:436-456).
+Gestión: PUT /hotfixes, PUT /codes/create, POST /codes/redeem/:accountId/:code, POST /news, POST /posts, POST /account/management/displayName|email|password/:accountid, POST /host/create|host/login, GET /beta/check, y todo el bloque /admin/* (ban/unban, reset password, grant items/vbucks/fulllocker, playlists, shop config, mass-delete… protegidos por checkAdminAuth = header Authorization == ADMIN_KEY, remix_server_register.go:316-323).
+Recompensas del juego: POST /:sessionId/BroadcastMatchRewards, POST /kill/:accountId, POST /win/:accountId (V-Bucks por kill/win según env).
+API del launcher (grupo /rmx/launcher/v1, main.go:409-427): GET /updater/:platform, GET /socket (WebSocket de launcher), GET/POST /banners, GET /dlls (lista DLLs de assets/dlls con nombre, URL y sha256 — remix_launcher_dlls.go:27-52), POST /dlls/upload/:name (admin, X-Admin-Key).
+
+Superficie Fortnite para el cliente (parcial): /fortnite/api/game/v2/profile/:accountId/client/* (MCP: QueryProfile, PurchaseCatalogEntry, GiftCatalogEntry, SetCosmeticLockerSlot, ClientQuestLogin…, main.go:551-571), /friends/api/..., /party/api/v1/Fortnite/*, /fortnite/api/storefront/v2/catalog|keychain, /fortnite/api/calendar/v1/timeline, /fortnite/api/cloudstorage/*, /lightswitch/api/service/bulk/status, /content/api/pages/fortnite-game, discovery/links/mnemonic, /api/v1/search/:accid, matchmaking (/fortnite/api/matchmaking/*, tickets, sessions dedicadas), WebSockets /xenon/matchmaking/base|session|data (modules/matchmaking/main.go:120-122), XMPP (/synapse/api/v1/:id/auth), además de /launcher/api/public/assets/..., /Builds/Fortnite/Content/CloudDir/... (sirve stuff.ini y manifiestos, y proxyea chunks a epicgames-download1.akamaized.net) y /datarouter (204 silencioso).
+
+Públicos: /shop (admin/shop.html), /api/public/shop|vbucks|locker, /assets, /admin, /mobile/install (redirige a un plist de TestFlight/MDM en r2.ploosh.dev).
+
+2.4 Manejo de auth (resumen)
+Tokens: JWT HS256 firmados con JWTSECRET (env), sesiones persistidas en el bucket Accounts_Sessions con TTL 24 h (ticker de limpieza, main.go:746-779). El middleware ClientAuthMiddleware (utilities\middleware\auth_client.go:31+) valida el Authorization: Bearer buscando el token en Accounts_Sessions, con caché en memoria de 30 s y rechazo de cuentas baneadas.
+Exchange codes: bucket ExchangeCodes con validez de 5 minutos (oauth_create.go:110-115).
+Device auth: POST /account/api/public/account/:accountId/deviceAuth y v3.
+Discord OAuth: state temporal en pendingAuthMap (TTL 10 min, limpieza cada 5 min) + bot token para leer roles del guild (roles también usados como gate beta y para colorear el rol en el launcher).
+Arc (externo): el backend puede desactivar el anticheat Arc de una cuenta llamando a dev-anticheat-v1.arc-services.dev con X-Arc-Auth fijo y X-Arc-Client: zszxfhpnjgzxzvpiiopxqrfpivjqhxbh (remix_server_account_management.go:187-191).
+2.5 ¿Cómo funciona sin puerto local del launcher?
+Todo es un único servidor HTTP(S) público (dominio backend-snow-services.crisu.qzz.io, escuchando en :4880 y :443 con TLS propio). No existe ningún componente cliente que abra puertos:
+
+El launcher solo habla HTTPS saliente (WinINet) contra ese dominio (login Discord, amigos, contador, update).
+En el lanzamiento, el launcher pasa el token de sesión del backend como -AUTH_PASSWORD y el cliente modificado del juego (RemixClient-Win64-Shipping.exe, descargado de r2.ploosh.dev) lleva hardcodeada la URL del backend: hace su POST /account/api/oauth/token (grant password con usuario@project.remix), y todas las llamadas de servicio (MCP, amigos, party, tienda, matchmaking vía WebSocket /xenon/matchmaking/*, XMPP/Synapse para presencia) van directo al dominio público.
+El 127.0.0.1:4040 que aparece en el código es solo interno del servidor (mini-HTTP del módulo matchmaking para /connections y /friends/status), no del cliente.
+Fragmentos clave (resumen de referencias)
+Login Discord (launcher): api.cpp:449-536 — polling discord/pending/<state>.
+Lanzamiento (launcher): launch_game.cpp:245-301 (SetupBuild/descargas r2.ploosh.dev), 347-371 (Arc identity+session), 389-413 (argumentos con -AUTH_LOGIN/-AUTH_PASSWORD/-t), arc.cpp:52-59, 97-117, 216-256 (JWT alg:none → dev-auth-v1.arc-services.dev/api/v1/auth/session).
+Login de juego (backend): oauth_create.go:169-236 (grant password con dominio @project.remix + gate beta por roles de Discord), 736-816 (emisión access/refresh), main.go:386-392 (rutas), eos_auth.go:23+ (auth EOS external_auth).
+Puertos y rutas: main.go:434-514 (/rmx/server/api/v1), 409-427 (/rmx/launcher/v1), 695-788 (servidores :4880/:443).
